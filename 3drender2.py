@@ -20,6 +20,15 @@ import xml.etree.ElementTree as ET
 import matplotlib.pyplot as plt
 from matplotlib.widgets import Button, TextBox
 
+# Fix for upstream Matplotlib bug: TextBox._resize is decorated with
+# @_call_with_reparented_event which accesses event.inaxes, but ResizeEvent
+# has no inaxes attribute, raising AttributeError: 'ResizeEvent' object has no attribute 'inaxes'
+try:
+    if hasattr(TextBox, '_resize'):
+        TextBox._resize = lambda self, event: self.stop_typing()
+except Exception:
+    pass
+
 try:
     import scipy.ndimage as ndi
     SCIPY_AVAILABLE = True
@@ -31,6 +40,25 @@ try:
     TKINTER_AVAILABLE = True
 except ImportError:
     TKINTER_AVAILABLE = False
+
+try:
+    import torch
+    TORCH_AVAILABLE = True
+    CUDA_AVAILABLE = torch.cuda.is_available()
+    if CUDA_AVAILABLE:
+        GPU_DEVICE = torch.device("cuda:0")
+        GPU_NAME = torch.cuda.get_device_name(0)
+        GPU_MEM_GB = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+    else:
+        GPU_DEVICE = torch.device("cpu")
+        GPU_NAME = "CPU"
+        GPU_MEM_GB = 0.0
+except ImportError:
+    TORCH_AVAILABLE = False
+    CUDA_AVAILABLE = False
+    GPU_DEVICE = None
+    GPU_NAME = "None"
+    GPU_MEM_GB = 0.0
 
 # ====================================
 # SETTINGS
@@ -1275,12 +1303,14 @@ def create_point_cloud(
     z_max_slice=None,
     filter_speckles=False,
     speckle_min_size=1,
-    speckle_max_size=5
+    speckle_max_size=5,
+    gpu_volume=None
 ):
     """
     Filters volume using true microscope intensity:
     Displays sections from z_min_slice to z_max_slice with intensity >= threshold_val.
     Retains true physical 3D elevation for every slice.
+    Accelerated with PyTorch CUDA tensors when available (NVIDIA RTX 5090).
     """
     total_z = raw_volume.shape[0]
     if z_max_slice is None:
@@ -1289,9 +1319,60 @@ def create_point_cloud(
     z_start = max(0, min(total_z - 1, int(round(z_min_slice)) - 1))
     z_end = max(z_start + 1, min(total_z, int(round(z_max_slice))))
 
-    # Sub-volume within the selected slice range
-    sub_volume = raw_volume[z_start:z_end]
+    # 1. FAST PATH: PyTorch CUDA on dedicated GPU
+    if CUDA_AVAILABLE and gpu_volume is not None:
+        try:
+            sub_t = gpu_volume[z_start:z_end]
+            mask_t = sub_t >= threshold_val
 
+            if not mask_t.any():
+                return np.empty((0, 3)), np.empty(0)
+
+            if filter_speckles:
+                # Morphological speckle labeling on CPU mask
+                mask_np = mask_t.cpu().numpy()
+                clean_mask_np = remove_isolated_speckles(
+                    mask_np,
+                    min_size=speckle_min_size,
+                    max_size=speckle_max_size
+                )
+                if not np.any(clean_mask_np):
+                    return np.empty((0, 3)), np.empty(0)
+                mask_t = torch.from_numpy(clean_mask_np).to(GPU_DEVICE, non_blocking=True)
+
+            # Extract active non-zero 3D voxel indices directly on CUDA cores
+            coords = torch.nonzero(mask_t)  # shape (N, 3): [local_z, y, x]
+            if coords.shape[0] == 0:
+                return np.empty((0, 3)), np.empty(0)
+
+            local_z = coords[:, 0]
+            y = coords[:, 1]
+            x = coords[:, 2]
+
+            intensity_t = sub_t[local_z, y, x]
+            actual_z = local_z + z_start
+
+            # Matrix-scale coordinates directly in GPU tensor memory
+            scale_x = float(voxel_x * DOWNSAMPLE_XY)
+            scale_y = float(voxel_y * DOWNSAMPLE_XY)
+            scale_z = float(voxel_z * Z_SCALE)
+
+            x_pts = x.float().mul_(scale_x)
+            y_pts = y.float().mul_(scale_y)
+            z_pts = actual_z.float().mul_(scale_z)
+
+            pts_t = torch.stack((x_pts, y_pts, z_pts), dim=1)
+
+            # Transfer compact extracted coordinates back to host memory
+            points = pts_t.cpu().numpy()
+            intensity = intensity_t.cpu().numpy()
+            return points, intensity
+        except Exception as e:
+            # Fall back to CPU if GPU memory or tensor extraction encounters an issue
+            pass
+
+    # 2. CPU FALLBACK PATH: NumPy
+    sub_volume = raw_volume[z_start:z_end]
     binary_mask = (sub_volume >= threshold_val)
     if not np.any(binary_mask):
         return np.empty((0, 3)), np.empty(0)
@@ -1528,6 +1609,51 @@ def render(
         val_str = f"{int(round(init_val))}" if is_int else f"{init_val:.2f}"
         print(f"[{ch}] {channel_names[ch]} ({method_name}): threshold = {val_str} (filters {cut_pct:.1f}% background)")
 
+    # Hardware acceleration diagnostics
+    try:
+        gpu_info = pv.GPUInfo()
+        gpu_renderer = str(gpu_info.renderer or "").strip()
+        print("\n" + "=" * 65)
+        print("HARDWARE ACCELERATION & GPU STATUS")
+        print("=" * 65)
+        if CUDA_AVAILABLE:
+            print(f"[PyTorch CUDA] Active GPU: {GPU_NAME}")
+            print(f"[PyTorch CUDA] Dedicated VRAM: {GPU_MEM_GB:.1f} GB")
+            print(f"[PyTorch CUDA] Tensor Core Acceleration: ENABLED (thresholding & point generation on GPU)")
+        else:
+            print("[PyTorch CUDA] NOT DETECTED (Running tensor thresholding on CPU)")
+
+        print(f"[PyVista / VTK] Active 3D OpenGL Renderer: {gpu_renderer if gpu_renderer else 'Default'}")
+        if any(igpu in gpu_renderer.lower() for igpu in ["intel", "basic render", "llvmpipe", "microsoft"]):
+            print("\n[ATTENTION] PyVista is currently running on INTEGRATED Graphics / CPU!")
+            print("            This is why your CPU is getting hot while your RTX 5090 is idle.")
+            print("            To fix on Windows:")
+            print("            1. Open Windows Settings -> System -> Display -> Graphics")
+            print("            2. Under 'Custom options for apps', click Browse and find python.exe")
+            print("            3. Set it to 'High Performance' (NVIDIA GeForce RTX 5090)")
+            print("            4. In NVIDIA Control Panel -> Program Settings -> add python.exe -> High-performance NVIDIA processor\n")
+        elif "nvidia" in gpu_renderer.lower():
+            print("[Hardware OK] 3D Viewport is actively rendering on your dedicated NVIDIA GPU!")
+        print("=" * 65 + "\n")
+    except Exception as e:
+        print(f"[Hardware Check] {e}")
+
+    # Upload processed volumes to PyTorch CUDA on RTX 5090
+    gpu_volumes = []
+    if CUDA_AVAILABLE:
+        print(f"[CUDA] Uploading processed volumes to {GPU_NAME} ({GPU_MEM_GB:.1f} GB VRAM)...")
+        for ch in range(num_channels):
+            try:
+                t_vol = torch.from_numpy(processed_volumes[ch]).to(GPU_DEVICE, non_blocking=True)
+                gpu_volumes.append(t_vol)
+                mb = (t_vol.element_size() * t_vol.nelement()) / (1024 * 1024)
+                print(f"  • Ch {ch} [{channel_names[ch]}]: {tuple(t_vol.shape)} cached on {GPU_NAME} ({mb:.1f} MB)")
+            except Exception as e:
+                print(f"  • Ch {ch} could not be placed on GPU: {e}")
+                gpu_volumes.append(None)
+    else:
+        gpu_volumes = [None] * num_channels
+
     # Physical dimensions in um and slice elevations
     vol_shape = processed_volumes[0].shape
     full_z = vol_shape[0] * voxel_z * Z_SCALE
@@ -1570,7 +1696,8 @@ def render(
             z_max_slice=state["z_max"],
             filter_speckles=state.get("filter_speckles", False),
             speckle_min_size=state.get("speckle_min", 1),
-            speckle_max_size=state.get("speckle_max", 5)
+            speckle_max_size=state.get("speckle_max", 5),
+            gpu_volume=gpu_volumes[ch] if ch < len(gpu_volumes) else None
         )
         print(f"Points: {len(points):,}")
 
@@ -1793,7 +1920,8 @@ def render(
                 z_max_slice=state["z_max"],
                 filter_speckles=state.get("filter_speckles", False),
                 speckle_min_size=state.get("speckle_min", 1),
-                speckle_max_size=state.get("speckle_max", 5)
+                speckle_max_size=state.get("speckle_max", 5),
+                gpu_volume=gpu_volumes[ch_idx] if ch_idx < len(gpu_volumes) else None
             )
             if len(pts) > 0:
                 new_cloud = pv.PolyData(pts)
@@ -1833,7 +1961,8 @@ def render(
             z_max_slice=state["z_max"],
             filter_speckles=state.get("filter_speckles", False),
             speckle_min_size=state.get("speckle_min", 1),
-            speckle_max_size=state.get("speckle_max", 5)
+            speckle_max_size=state.get("speckle_max", 5),
+            gpu_volume=gpu_volumes[ch_idx] if ch_idx < len(gpu_volumes) else None
         )
 
         if len(pts) > 0:
@@ -1885,34 +2014,62 @@ def render(
                     set_channel_visibility(row_idx, not channel_actors[row_idx].GetVisibility())
                 return
 
-            # Check if click is inside the Bottom Filter Button
-            fb_x_min = int(((w - TAB_W) // 2) - FILTER_BTN_W - 14)
+            DOCK_SPACING = 10
+            dock_total_w = FILTER_BTN_W + DOCK_SPACING + TAB_W + DOCK_SPACING + RULER_BTN_W + DOCK_SPACING + ALTER_BTN_W
+            dock_start_x = max(10, int((w - dock_total_w) / 2.0))
+
+            fb_x_min = dock_start_x
             fb_x_max = fb_x_min + FILTER_BTN_W
-            fb_y_min = TAB_MARGIN_BOTTOM
-            fb_y_max = TAB_MARGIN_BOTTOM + FILTER_BTN_H
-            if fb_x_min <= x <= fb_x_max and fb_y_min <= y <= fb_y_max:
+            tab_x_min = fb_x_max + DOCK_SPACING
+            tab_x_max = tab_x_min + TAB_W
+            rb_x_min = tab_x_max + DOCK_SPACING
+            rb_x_max = rb_x_min + RULER_BTN_W
+            alter_x_min = rb_x_max + DOCK_SPACING
+            alter_x_max = alter_x_min + ALTER_BTN_W
+
+            # Check if click is inside Floating Alter Center Menu Card
+            if alter_center_active[0]:
+                menu_x = max(10, int((w - MENU_CARD_W) / 2.0))
+                menu_y = TAB_MARGIN_BOTTOM + TAB_H + 10
+                if menu_x <= x <= menu_x + MENU_CARD_W and menu_y <= y <= menu_y + MENU_CARD_H:
+                    from_top = (menu_y + MENU_CARD_H) - y
+                    rel_x = x - menu_x
+                    # Check action buttons row (from_top between 40 and 72)
+                    if 38 <= from_top <= 72:
+                        btn_w = 188
+                        bx1 = 16
+                        bx2 = bx1 + btn_w + 12
+                        if bx1 <= rel_x <= bx1 + btn_w:
+                            # Back to Center button clicked inside menu
+                            recenter_to_middle()
+                            return
+                        elif bx2 <= rel_x <= bx2 + btn_w:
+                            # Hide Ball button clicked inside menu
+                            hide_alter_center()
+                            return
+                    return
+
+            # Check if click is inside the Bottom Filter Button
+            if fb_x_min <= x <= fb_x_max and TAB_MARGIN_BOTTOM <= y <= TAB_MARGIN_BOTTOM + FILTER_BTN_H:
                 if 'toggle_speckle_filter' in locals() or 'toggle_speckle_filter' in globals():
                     toggle_speckle_filter()
                 return
 
             # Check if click is inside the Bottom Pull-Up Tab
-            tab_x_min = (w - TAB_W) // 2
-            tab_x_max = tab_x_min + TAB_W
-            tab_y_min = TAB_MARGIN_BOTTOM
-            tab_y_max = TAB_MARGIN_BOTTOM + TAB_H
-            if tab_x_min <= x <= tab_x_max and tab_y_min <= y <= tab_y_max:
+            if tab_x_min <= x <= tab_x_max and TAB_MARGIN_BOTTOM <= y <= TAB_MARGIN_BOTTOM + TAB_H:
                 if 'zen_popup' in locals() or 'zen_popup' in globals():
                     zen_popup.toggle_visibility()
                 return
 
             # Check if click is inside the Bottom Ruler Button
-            rb_x_min = int(((w - TAB_W) // 2) + TAB_W + 14)
-            rb_x_max = rb_x_min + RULER_BTN_W
-            rb_y_min = TAB_MARGIN_BOTTOM
-            rb_y_max = TAB_MARGIN_BOTTOM + RULER_BTN_H
-            if rb_x_min <= x <= rb_x_max and rb_y_min <= y <= rb_y_max:
+            if rb_x_min <= x <= rb_x_max and TAB_MARGIN_BOTTOM <= y <= TAB_MARGIN_BOTTOM + RULER_BTN_H:
                 if 'toggle_ruler_mode' in locals():
                     toggle_ruler_mode()
+                return
+
+            # Check if click is inside the Bottom Alter Center Button
+            if alter_x_min <= x <= alter_x_max and TAB_MARGIN_BOTTOM <= y <= TAB_MARGIN_BOTTOM + ALTER_BTN_H:
+                toggle_alter_center()
                 return
 
             # Check if Ruler Measurement is active or Shift+Click was pressed
@@ -1931,6 +2088,18 @@ def render(
                         except Exception:
                             pass
                         return
+
+            # If Alter Center mode is active, clicking on the specimen moves the ball in X/Y only.
+            if alter_center_active[0]:
+                picked_pt = pick_specimen_3d_point(x, y) if 'pick_specimen_3d_point' in locals() else None
+                if picked_pt is not None:
+                    move_orbit_pivot_to(picked_pt[0], picked_pt[1], locked_pivot_z, update_widget=True)
+                    print(f"\n[Alter Center] Ball moved to X={picked_pt[0]:.2f}, Y={picked_pt[1]:.2f} µm (Z locked at {locked_pivot_z:.2f} µm)")
+                    try:
+                        caller.SetAbortEvent(1)
+                    except Exception:
+                        pass
+                    return
         except Exception:
             pass
 
@@ -2019,20 +2188,36 @@ def render(
     tl_hud_widget = None
 
     # Bottom Pull-up Tab for Histogram & Thresholds
-    TAB_W = 340
+    TAB_W = 280
     TAB_H = 34
     TAB_MARGIN_BOTTOM = 12
     tab_widget = None
 
     # Bottom Background Filter Button (1-5px isolated dots)
-    FILTER_BTN_W = 270
+    FILTER_BTN_W = 210
     FILTER_BTN_H = 34
     filter_btn_widget = None
 
     # Bottom 3D Nano-Ruler Button (Nanometer measurement)
-    RULER_BTN_W = 240
+    RULER_BTN_W = 190
     RULER_BTN_H = 34
     ruler_btn_widget = None
+
+    # Bottom Alter Center Button (Toggle interactive 3D ball to reposition gravity center)
+    ALTER_BTN_W = 190
+    ALTER_BTN_H = 34
+    alter_btn_widget = None
+
+    # Floating Alter Center Menu Card (Shows live coordinates, Hide button, and Back to Center button)
+    MENU_CARD_W = 420
+    MENU_CARD_H = 78
+    alter_menu_widget = None
+
+    # Live gravity orbit/zoom pivot state
+    alter_center_active = [False]
+    locked_pivot_z = float(full_z / 2.0)
+    current_pivot = [full_x / 2.0, full_y / 2.0, locked_pivot_z]
+    sphere_widget = None
 
     def reposition_hud(w, h):
         try:
@@ -2060,40 +2245,52 @@ def render(
                 rep_tl.SetPosition2(tl_nw, tl_nh)
                 rep_tl.Modified()
 
+            # Symmetrical four-button bottom dock layout
+            DOCK_SPACING = 10
+            dock_total_w = FILTER_BTN_W + DOCK_SPACING + TAB_W + DOCK_SPACING + RULER_BTN_W + DOCK_SPACING + ALTER_BTN_W
+            dock_start_x = max(10, int((w - dock_total_w) / 2.0))
+
+            fb_x_pix = dock_start_x
+            tab_x_pix = fb_x_pix + FILTER_BTN_W + DOCK_SPACING
+            rb_x_pix = tab_x_pix + TAB_W + DOCK_SPACING
+            alter_x_pix = rb_x_pix + RULER_BTN_W + DOCK_SPACING
+
             # Bottom Center Pull-up Tab
             if tab_widget is not None:
                 rep_tab = tab_widget.GetRepresentation()
-                tab_nx = max(0.001, ((w - TAB_W) / 2.0) / float(w))
-                tab_ny = max(0.001, float(TAB_MARGIN_BOTTOM) / float(h))
-                tab_nw = min(0.99, TAB_W / float(w))
-                tab_nh = min(0.99, TAB_H / float(h))
-                rep_tab.SetPosition(tab_nx, tab_ny)
-                rep_tab.SetPosition2(tab_nw, tab_nh)
+                rep_tab.SetPosition(max(0.001, tab_x_pix / float(w)), max(0.001, float(TAB_MARGIN_BOTTOM) / float(h)))
+                rep_tab.SetPosition2(min(0.99, TAB_W / float(w)), min(0.99, TAB_H / float(h)))
                 rep_tab.Modified()
 
             # Bottom Filter Button (1-5px isolated dots)
             if filter_btn_widget is not None:
                 rep_fb = filter_btn_widget.GetRepresentation()
-                fb_x_pix = ((w - TAB_W) / 2.0) - FILTER_BTN_W - 14
-                fb_nx = max(0.001, fb_x_pix / float(w))
-                fb_ny = max(0.001, float(TAB_MARGIN_BOTTOM) / float(h))
-                fb_nw = min(0.99, FILTER_BTN_W / float(w))
-                fb_nh = min(0.99, FILTER_BTN_H / float(h))
-                rep_fb.SetPosition(fb_nx, fb_ny)
-                rep_fb.SetPosition2(fb_nw, fb_nh)
+                rep_fb.SetPosition(max(0.001, fb_x_pix / float(w)), max(0.001, float(TAB_MARGIN_BOTTOM) / float(h)))
+                rep_fb.SetPosition2(min(0.99, FILTER_BTN_W / float(w)), min(0.99, FILTER_BTN_H / float(h)))
                 rep_fb.Modified()
 
             # Bottom Ruler Button (Measure in nM)
             if ruler_btn_widget is not None:
                 rep_rb = ruler_btn_widget.GetRepresentation()
-                rb_x_pix = ((w - TAB_W) / 2.0) + TAB_W + 14
-                rb_nx = max(0.001, rb_x_pix / float(w))
-                rb_ny = max(0.001, float(TAB_MARGIN_BOTTOM) / float(h))
-                rb_nw = min(0.99, RULER_BTN_W / float(w))
-                rb_nh = min(0.99, RULER_BTN_H / float(h))
-                rep_rb.SetPosition(rb_nx, rb_ny)
-                rep_rb.SetPosition2(rb_nw, rb_nh)
+                rep_rb.SetPosition(max(0.001, rb_x_pix / float(w)), max(0.001, float(TAB_MARGIN_BOTTOM) / float(h)))
+                rep_rb.SetPosition2(min(0.99, RULER_BTN_W / float(w)), min(0.99, RULER_BTN_H / float(h)))
                 rep_rb.Modified()
+
+            # Bottom Alter Center Button
+            if alter_btn_widget is not None:
+                rep_alter = alter_btn_widget.GetRepresentation()
+                rep_alter.SetPosition(max(0.001, alter_x_pix / float(w)), max(0.001, float(TAB_MARGIN_BOTTOM) / float(h)))
+                rep_alter.SetPosition2(min(0.99, ALTER_BTN_W / float(w)), min(0.99, ALTER_BTN_H / float(h)))
+                rep_alter.Modified()
+
+            # Floating Alter Center Menu Card (positioned right above the Alter/Reset dock buttons)
+            if alter_menu_widget is not None:
+                rep_menu = alter_menu_widget.GetRepresentation()
+                menu_x_pix = max(10, int((w - MENU_CARD_W) / 2.0))
+                menu_y_pix = TAB_MARGIN_BOTTOM + TAB_H + 10
+                rep_menu.SetPosition(max(0.001, menu_x_pix / float(w)), max(0.001, float(menu_y_pix) / float(h)))
+                rep_menu.SetPosition2(min(0.99, MENU_CARD_W / float(w)), min(0.99, MENU_CARD_H / float(h)))
+                rep_menu.Modified()
         except Exception:
             pass
 
@@ -2163,7 +2360,7 @@ def render(
         except Exception:
             pass
 
-    plotter.add_timer_event(max_steps=10000000, duration=35, callback=pump_events)
+    plotter.add_timer_event(max_steps=10000000, duration=80, callback=pump_events)
 
     # Initial display
     update_channel_hud()
@@ -2753,6 +2950,188 @@ def render(
         except Exception:
             pass
 
+    # =========================================================================
+    # ALTER CENTER BUTTON & FLOATING MENU CARD (MOVABLE 3D BALL + HIDE + RESET)
+    # =========================================================================
+    def render_alter_btn_card(is_active=False):
+        img = Image.new("RGBA", (ALTER_BTN_W, ALTER_BTN_H), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        bg = (14, 34, 48, 245) if is_active else (18, 24, 34, 230)
+        border = (0, 210, 255, 255) if is_active else (60, 85, 115, 255)
+        draw.rounded_rectangle([1, 1, ALTER_BTN_W - 2, ALTER_BTN_H - 2], radius=6, fill=bg, outline=border, width=1)
+
+        dot_color = (0, 235, 255, 255) if is_active else (120, 140, 160, 255)
+        text = "●  ALTER CENTER: ON" if is_active else "⌖  ALTER CENTER"
+
+        try:
+            font_btn = ImageFont.truetype("arialbd.ttf", 11)
+        except Exception:
+            try:
+                font_btn = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 11)
+            except Exception:
+                font_btn = ImageFont.load_default()
+
+        bbox = font_btn.getbbox(text)
+        tw = bbox[2] - bbox[0]
+        th = bbox[3] - bbox[1]
+        tx = (ALTER_BTN_W - tw) // 2
+        ty = (ALTER_BTN_H - th) // 2
+
+        if is_active:
+            draw.ellipse([tx - 14, ALTER_BTN_H // 2 - 3, tx - 8, ALTER_BTN_H // 2 + 3], fill=dot_color)
+        draw.text((tx, ty), text, fill=(220, 250, 255, 255) if is_active else (180, 195, 215, 255), font=font_btn)
+        return img
+
+    def render_alter_center_menu_card(pivot_xyz):
+        img = Image.new("RGBA", (MENU_CARD_W, MENU_CARD_H), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+
+        # Translucent glass panel matching HUD aesthetic
+        draw.rounded_rectangle(
+            [1, 1, MENU_CARD_W - 2, MENU_CARD_H - 2],
+            radius=8,
+            fill=(14, 20, 30, 245),
+            outline=(0, 210, 255, 255),
+            width=1
+        )
+
+        try:
+            font_title = ImageFont.truetype("arialbd.ttf", 12)
+            font_sub = ImageFont.truetype("arial.ttf", 10)
+            font_btn = ImageFont.truetype("arialbd.ttf", 11)
+        except Exception:
+            font_title = font_sub = font_btn = ImageFont.load_default()
+
+        # Title & Live Coordinates
+        draw.text((16, 8), "⌖ ALTER GRAVITY CENTER", fill="#00E5FF", font=font_title)
+        coords_text = f"X: {pivot_xyz[0]:.1f} µm   Y: {pivot_xyz[1]:.1f} µm   Z locked: {pivot_xyz[2]:.1f} µm"
+        draw.text((192, 9), coords_text, fill="#A8C4E0", font=font_sub)
+
+        draw.text((16, 26), "Drag the cyan ball or click the specimen to move in X/Y. Z stays fixed.", fill="#7E94AB", font=font_sub)
+
+        # Action Buttons inside menu:
+        # Left: [ ↺ BACK TO CENTER ]
+        btn_w = 188
+        btn_h = 28
+        btn_y = 42
+
+        bx1 = 16
+        draw.rounded_rectangle([bx1, btn_y, bx1 + btn_w, btn_y + btn_h], radius=5, fill=(24, 34, 48, 240), outline=(0, 180, 216, 255), width=1)
+        draw.text((bx1 + 32, btn_y + 7), "↺  BACK TO CENTER", fill="#E1F5FE", font=font_btn)
+
+        # Right: [ ✕ HIDE BALL ]
+        bx2 = bx1 + btn_w + 12
+        draw.rounded_rectangle([bx2, btn_y, bx2 + btn_w, btn_y + btn_h], radius=5, fill=(38, 24, 28, 240), outline=(235, 87, 87, 255), width=1)
+        draw.text((bx2 + 52, btn_y + 7), "✕  HIDE BALL", fill="#FFE8E8", font=font_btn)
+
+        return img
+
+    def render_empty_transparent_card(w, h):
+        return Image.new("RGBA", (w, h), (0, 0, 0, 0))
+
+    # Add Alter Center button widget
+    alter_btn_pv = pil_to_pyvista_imagedata(render_alter_btn_card(is_active=False))
+    alter_btn_widget = plotter.add_logo_widget(
+        alter_btn_pv,
+        position=(0.60, float(TAB_MARGIN_BOTTOM) / float(max(1, cur_h))),
+        size=(min(0.98, ALTER_BTN_W / float(max(1, cur_w))), min(0.98, ALTER_BTN_H / float(max(1, cur_h)))),
+        opacity=1.0
+    )
+    try:
+        alter_btn_widget.ProcessEventsOff()
+    except Exception:
+        pass
+
+    # Add Floating Alter Center Menu Card widget (initially empty/transparent)
+    alter_menu_pv = pil_to_pyvista_imagedata(render_empty_transparent_card(MENU_CARD_W, MENU_CARD_H))
+    alter_menu_widget = plotter.add_logo_widget(
+        alter_menu_pv,
+        position=(0.35, float(TAB_MARGIN_BOTTOM + TAB_H + 10) / float(max(1, cur_h))),
+        size=(min(0.98, MENU_CARD_W / float(max(1, cur_w))), min(0.98, MENU_CARD_H / float(max(1, cur_h)))),
+        opacity=1.0
+    )
+    try:
+        alter_menu_widget.ProcessEventsOff()
+    except Exception:
+        pass
+
+    def update_alter_center_ui():
+        try:
+            if alter_btn_widget is not None:
+                new_img = render_alter_btn_card(is_active=alter_center_active[0])
+                new_pv = pil_to_pyvista_imagedata(new_img)
+                rep = alter_btn_widget.GetRepresentation()
+                rep.SetImage(new_pv)
+                rep.Modified()
+
+            if alter_menu_widget is not None:
+                if alter_center_active[0]:
+                    menu_img = render_alter_center_menu_card(current_pivot)
+                else:
+                    menu_img = render_empty_transparent_card(MENU_CARD_W, MENU_CARD_H)
+                menu_pv = pil_to_pyvista_imagedata(menu_img)
+                rep_m = alter_menu_widget.GetRepresentation()
+                rep_m.SetImage(menu_pv)
+                rep_m.Modified()
+        except Exception:
+            pass
+
+    def move_orbit_pivot_to(new_x, new_y, new_z=None, update_widget=True):
+        cam = plotter.renderer.GetActiveCamera()
+        old_pivot = np.asarray(current_pivot, dtype=float)
+        # Gravity/orbit center is constrained to the fixed middle Z plane.
+        new_pivot = np.asarray([float(new_x), float(new_y), locked_pivot_z], dtype=float)
+        shift = new_pivot - old_pivot
+
+        cam.SetPosition(*(np.asarray(cam.GetPosition(), dtype=float) + shift))
+        cam.SetFocalPoint(*new_pivot)
+        current_pivot[:] = new_pivot.tolist()
+        cam.SetWindowCenter(0.0, 0.0)
+        plotter.reset_camera_clipping_range()
+
+        if update_widget and sphere_widget is not None:
+            try:
+                sphere_widget.SetCenter(*new_pivot)
+            except Exception:
+                pass
+
+        update_alter_center_ui()
+        plotter.render()
+
+    def show_alter_center():
+        alter_center_active[0] = True
+        if sphere_widget is not None:
+            try:
+                sphere_widget.SetCenter(*current_pivot)
+                sphere_widget.On()
+            except Exception:
+                pass
+        update_alter_center_ui()
+        plotter.render()
+        print("\n[Alter Center] Mode ACTIVE: Drag the cyan 3D ball or click on the specimen to reposition the gravity pivot.")
+
+    def hide_alter_center():
+        alter_center_active[0] = False
+        if sphere_widget is not None:
+            try:
+                sphere_widget.Off()
+            except Exception:
+                pass
+        update_alter_center_ui()
+        plotter.render()
+        print(f"\n[Alter Center] Ball HIDDEN. Gravity pivot locked at: X={current_pivot[0]:.1f}, Y={current_pivot[1]:.1f}, Z={current_pivot[2]:.1f} µm.")
+
+    def toggle_alter_center():
+        if alter_center_active[0]:
+            hide_alter_center()
+        else:
+            show_alter_center()
+
+    def recenter_to_middle():
+        target = [full_x / 2.0, full_y / 2.0, locked_pivot_z]
+        move_orbit_pivot_to(target[0], target[1], target[2], update_widget=True)
+        print(f"\n[Gravity Pivot] Recentered to specimen middle: X={target[0]:.1f}, Y={target[1]:.1f} µm (Z locked at {target[2]:.1f} µm).")
+
     def handle_ruler_click(click_x, click_y):
         """Processes a click when ruler mode is active or Shift+Click is held."""
         picked_pt = pick_specimen_3d_point(click_x, click_y)
@@ -2965,9 +3344,13 @@ def render(
 
     plotter.add_key_event("m", toggle_ruler_mode)
     plotter.add_key_event("M", toggle_ruler_mode)
-    plotter.add_key_event("c", clear_all_measurements)
-    plotter.add_key_event("C", clear_all_measurements)
+    plotter.add_key_event("x", clear_all_measurements)
+    plotter.add_key_event("X", clear_all_measurements)
+    plotter.add_key_event("Delete", clear_all_measurements)
     plotter.add_key_event("z", undo_last_measurement)
+    plotter.add_key_event("c", recenter_to_middle)
+    plotter.add_key_event("C", recenter_to_middle)
+    plotter.add_key_event("Escape", hide_alter_center)
     plotter.add_key_event("Z", undo_last_measurement)
     plotter.add_key_event("BackSpace", undo_last_measurement)
 
@@ -3108,6 +3491,7 @@ def render(
             print(f"[Snapshot Error]: {e}")
 
     def reset_camera_view():
+        recenter_to_middle()
         plotter.camera_position = [
             (full_x * 1.5, -full_y * 1.5, full_z * 2),
             image_center,
@@ -3120,17 +3504,18 @@ def render(
             pass
         plotter.reset_camera_clipping_range()
         plotter.render()
-        print("\n[Camera] Reset view to centered orientation.")
+        print("\n[Camera] Reset view and gravity pivot to volume middle.")
 
     # Hotkey registrations
     plotter.add_key_event("e", lambda: do_export_html())
     plotter.add_key_event("E", lambda: do_export_html())
-    plotter.add_key_event("g", lambda: do_export_glb())
-    plotter.add_key_event("G", lambda: do_export_glb())
+    plotter.add_key_event("b", lambda: do_export_glb())
+    plotter.add_key_event("B", lambda: do_export_glb())
     plotter.add_key_event("p", lambda: do_export_ply())
     plotter.add_key_event("P", lambda: do_export_ply())
-    plotter.add_key_event("s", lambda: do_save_snapshot())
-    plotter.add_key_event("S", lambda: do_save_snapshot())
+    plotter.add_key_event("k", lambda: do_save_snapshot())
+    plotter.add_key_event("K", lambda: do_save_snapshot())
+    plotter.add_key_event("F12", lambda: do_save_snapshot())
     plotter.add_key_event("r", reset_camera_view)
     plotter.add_key_event("R", reset_camera_view)
 
@@ -3147,9 +3532,11 @@ def render(
             plotter.close()
             return
 
-    # Use the geometric center of the rendered image volume as the permanent
-    # camera orbit pivot, shared by the initial view and cursor-anchored wheel zoom.
+    # Use the geometric center of the rendered image volume as the default
+    # camera orbit pivot, shared by the initial view and wheel zoom.
     image_center = (full_x / 2.0, full_y / 2.0, full_z / 2.0)
+    current_pivot[:] = list(image_center)
+
     plotter.camera_position = [
         (full_x * 1.5, -full_y * 1.5, full_z * 2),
         image_center,
@@ -3157,7 +3544,42 @@ def render(
     ]
     plotter.reset_camera_clipping_range()
 
-    # Mouse-wheel zoom stays centered on the image, even when zooming at the cursor.
+    # Create the interactive 3D Movable Sphere Widget for altering the center
+    vol_diag = float(np.sqrt(full_x**2 + full_y**2 + full_z**2)) if (full_x > 0) else 100.0
+    ball_radius = max(0.12, vol_diag * 0.018)
+
+    try:
+        def on_sphere_drag(point):
+            # Ignore drag depth: keep the sphere and orbit pivot on the fixed Z plane.
+            move_orbit_pivot_to(point[0], point[1], locked_pivot_z, update_widget=True)
+
+        sphere_widget = plotter.add_sphere_widget(
+            callback=on_sphere_drag,
+            center=current_pivot,
+            radius=ball_radius,
+            color="#00E5FF",
+            selected_color="#FFD700",
+            pass_widget=False,
+            test_callback=False
+        )
+        try:
+            sphere_widget.ScaleOff()
+            sphere_widget.HandleDirectionalOff()
+        except Exception:
+            pass
+        # Initially hidden; appears when user clicks "ALTER CENTER"
+        try:
+            sphere_widget.Off()
+        except Exception:
+            pass
+    except Exception as e:
+        print(f"[Notice] Interactive sphere widget fallback: {e}")
+
+    # Synchronize initial dock layout
+    cur_w, cur_h = plotter.window_size
+    reposition_hud(cur_w, cur_h)
+
+    # Mouse-wheel zoom stays centered on the live gravity focal point
     install_cursor_zoom(plotter, focal_point=image_center)
 
     plotter.show()
@@ -3171,15 +3593,23 @@ def main():
         description="Fast High-Fidelity 3D CZI Multi-Channel Microscopy Viewer & File Exporter",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
+Interactive Controls in Viewer:
+  [ALTER CENTER] button   Show interactive cyan ball; drag/click to move the center in X/Y
+  [BACK TO CENTER] menu   Recenter the gravity pivot and ball; the ball stays on its fixed Z plane
+  [HIDE BALL] button      Hide the ball after positioning (gravity pivot remains locked)
+  [C]        Recenter gravity pivot and view back to middle
+  [Esc]      Hide the 3D ball and close Alter Center menu
+
 Interactive Hotkeys in Viewer:
   [M]        Toggle 3D Nano-Ruler (measure in nm between chosen points)
   [C]        Clear all ruler measurements and markers
   [Z]        Undo last ruler measurement (or Backspace)
   Shift+LMB  Instant point measure (works anytime without toggling mode)
   [E]        Export standalone interactive 3D HTML web file (opens in any browser)
-  [G]        Export standard 3D model (.glb / .gltf)
+  [B]        Export standard 3D model (.glb / .gltf)
   [P]        Export scientific colored point cloud (.ply)
-  [S]        Save high-resolution snapshot (.png)
+  [K] / [F12] Save high-resolution snapshot (.png)
+  [G]        Toggle 3D reference grid
   [R]        Reset camera view to centered orientation
   [1] - [9]  Toggle channel visibility
   [H]        Toggle histogram and intensity thresholds
